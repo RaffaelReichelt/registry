@@ -1,141 +1,85 @@
-# Docker Registry2 mit Tailscale Sidecar
+# Docker Registry2 mit Tailscale Sidecar (Swarm Stack)
 
-Diese Konfiguration stellt eine private Docker Registry (`registry:2`) bereit, die ausschließlich über dein Tailscale-Netzwerk via HTTPS erreichbar ist.
+Private Docker Registry (`registry:2`), die ausschließlich über das Tailnet per HTTPS erreichbar ist.
+
+## Aufbau
+
+- `tailscale`: Tailscale im Userspace-Modus (kein `/dev/net/tun`, keine zusätzlichen Capabilities nötig). Terminiert HTTPS via `tailscale serve` und proxyt auf `http://registry:5000`.
+- `registry`: `registry:2`, nur im Overlay-Netz `registry` erreichbar, kein Port am Host veröffentlicht.
+- Die Serve-Config liegt in [tailscale/serve.json](tailscale/serve.json) und wird als Swarm-Config eingebunden. `${TS_CERT_DOMAIN}` ersetzt Tailscale selbst durch den FQDN des Nodes.
+- Beide Services sind per Placement-Constraint an einen Node gebunden, weil die Volumes lokal sind.
 
 ## Voraussetzungen
 
-- Docker + Docker Compose
-- Tailscale Auth Key
-- Tailnet-FQDN für den Node (z. B. `registry2.example-tailnet.ts.net`)
+- Docker Swarm (`docker swarm init`)
+- In der Tailscale Admin-Console: MagicDNS und HTTPS-Zertifikate aktiviert
+- Tailscale Auth Key (am besten tagged, z. B. `tag:registry`)
 
-## Konfiguration
+## Einrichtung
 
-1. Beispiel-Umgebungsdatei kopieren:
-
-   ```bash
-   cp .env.example .env
-   ```
-
-2. Werte in `.env` setzen:
-
-   - `TS_AUTHKEY`
-   - `TS_CERT_DOMAIN`
-
-## Starten
+Node für die Registry markieren:
 
 ```bash
-docker compose up -d
+docker node update --label-add registry=true <node-name>
 ```
+
+Umgebungsdatei anlegen:
+
+```bash
+cp .env.example .env
+# TS_AUTHKEY eintragen
+```
+
+## Deployen
+
+`docker stack deploy` liest `.env` nicht selbst:
+
+```bash
+set -a; source .env; set +a
+docker stack deploy -c docker-compose.yml registry
+```
+
+Status und Logs:
+
+```bash
+docker stack ps registry
+docker service logs -f registry_tailscale
+```
+
+Der Auth Key wird nur bei der Erstregistrierung gebraucht. Danach liegt der Node-State im Volume `tailscale-state`, das Ablaufen des Keys stört den laufenden Betrieb nicht. Bei einem neuen Key: `.env` anpassen und den Stack erneut deployen.
+
+Ändert sich `tailscale/serve.json`, den Config-Namen in `docker-compose.yml` hochzählen (`registry_serve_v2`), da Swarm-Configs unveränderlich sind.
 
 ## Erreichbarkeit testen
 
 ```bash
-curl -I https://<TS_CERT_DOMAIN>/v2/
+curl -i https://<registry-fqdn>/v2/
 ```
 
-Bei Erfolg sollte ein `401 Unauthorized` oder `200`-ähnlicher Registry-Response zurückkommen (beides zeigt in der Regel, dass der Endpoint erreichbar ist).
+Erwartet wird `200 OK` mit `{}`. Der FQDN lautet `registry2.<tailnet>.ts.net`.
 
-## Docker Login
+## Images pushen und pullen
 
 ```bash
-docker login https://<TS_CERT_DOMAIN>
+docker tag my-image:latest <registry-fqdn>/myapp:1.0.0
+docker push <registry-fqdn>/myapp:1.0.0
+docker pull <registry-fqdn>/myapp:1.0.0
 ```
 
-Hinweis: Wenn keine zusätzliche Registry-Basic-Auth aktiv ist, ist der Benutzername technisch oft nicht relevant; einige Docker-Clients verlangen trotzdem Eingabe.
+## Authentifizierung
 
-## Images pushen
+Die Registry hat keine eigene Auth, der Zugriff wird allein über Tailscale und die Tailnet-ACLs gesteuert. Beschränke den Zugriff auf Port 443 des Tags `tag:registry` auf die Geräte, die pushen oder pullen sollen. Ein `docker login` ist nicht nötig.
 
-Image bauen und taggen:
+Löschen von Images ist aktiviert (`REGISTRY_STORAGE_DELETE_ENABLED`). Der Speicher wird erst nach einem Garbage-Collect freigegeben:
 
 ```bash
-docker build -t <TS_CERT_DOMAIN>/myapp:1.0.0 .
+docker exec $(docker ps -q -f name=registry_registry) registry garbage-collect /etc/docker/registry/config.yml
 ```
 
-Push:
+## Entfernen
 
 ```bash
-docker push <TS_CERT_DOMAIN>/myapp:1.0.0
+docker stack rm registry
 ```
 
-## Images pullen
-
-```bash
-docker pull <TS_CERT_DOMAIN>/myapp:1.0.0
-```
-
-## Bereits vorhandenes lokales Image umtaggen
-
-```bash
-docker tag my-local-image:latest <TS_CERT_DOMAIN>/myapp:latest
-docker push <TS_CERT_DOMAIN>/myapp:latest
-```
-
-## Hinweis zur Authentifizierung
-
-Wenn der Zugriff auf die Registry ausschließlich über Tailscale erfolgt und dein Tailnet per ACLs sauber eingeschränkt ist, reicht in vielen Setups die Tailscale-Authentifizierung bereits aus.
-
-## Automatische Rotation der Tailscale Auth Keys
-
-Da Auth Keys maximal 90 Tage gültig sind, ist eine automatische Rotation sinnvoll.
-
-### Architektur der Rotation
-
-- Das Script [`scripts/rotate-ts-authkey.sh`](/home/raffael/Projekte/registry/scripts/rotate-ts-authkey.sh) verwendet einen Tailscale OAuth Client.
-- Es holt damit ein kurzlebiges API-Access-Token (ca. 1h).
-- Es erzeugt dann per Tailscale API einen frischen Auth Key.
-- Der neue Key wird in [`.env`](/home/raffael/Projekte/registry/.env) als `TS_AUTHKEY` ersetzt.
-- Danach wird der `tailscale`-Service via `docker compose up -d tailscale` neu gestartet.
-
-### 1) Rotations-Konfiguration anlegen
-
-```bash
-cp .rotation.env.example .rotation.env
-chmod 600 .rotation.env
-```
-
-Werte in [`.rotation.env`](/home/raffael/Projekte/registry/.rotation.env) setzen:
-
-- `TS_TAILNET` (z. B. `example.com`)
-- `TS_OAUTH_CLIENT_ID`
-- `TS_OAUTH_CLIENT_SECRET`
-
-Die übrigen Werte können in der Regel so bleiben (`TS_KEY_EXPIRY_SECONDS=2592000` = 30 Tage).
-
-### 2) Script ausführbar machen
-
-```bash
-chmod +x scripts/rotate-ts-authkey.sh
-```
-
-### 3) Einmaliger manueller Test
-
-```bash
-./scripts/rotate-ts-authkey.sh
-```
-
-### 4) systemd Automation aktivieren
-
-Die Unit-Dateien liegen in [systemd/](/home/raffael/Projekte/registry/systemd/):
-
-- [tailscale-authkey-rotate.service](/home/raffael/Projekte/registry/systemd/tailscale-authkey-rotate.service)
-- [tailscale-authkey-rotate.timer](/home/raffael/Projekte/registry/systemd/tailscale-authkey-rotate.timer)
-
-Installieren und aktivieren:
-
-```bash
-sudo cp systemd/tailscale-authkey-rotate.service /etc/systemd/system/
-sudo cp systemd/tailscale-authkey-rotate.timer /etc/systemd/system/
-sudo systemctl daemon-reload
-sudo systemctl enable --now tailscale-authkey-rotate.timer
-```
-
-Status prüfen:
-
-```bash
-systemctl list-timers | grep tailscale-authkey-rotate
-systemctl status tailscale-authkey-rotate.timer
-```
-
-### Benötigte OAuth-Berechtigung
-
-Der OAuth Client sollte mindestens die Berechtigung besitzen, Auth Keys zu erzeugen (`auth_keys` Write). Wenn du Tags setzt (z. B. `tag:registry`), muss der OAuth Client diese Tags ebenfalls vergeben dürfen.
+Die Volumes `registry_registry-data` und `registry_tailscale-state` bleiben erhalten.

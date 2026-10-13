@@ -1,58 +1,55 @@
 services:
   tailscale:
     image: tailscale/tailscale:stable
-    container_name: tailscale-registry2
     hostname: registry2
     environment:
       TS_AUTHKEY: ${TS_AUTHKEY}
+      TS_HOSTNAME: registry2
       TS_STATE_DIR: /var/lib/tailscale
-      TS_USERSPACE: "false"
-      TS_SERVE_CONFIG: |
-        {
-          "TCP": {
-            "443": {
-              "HTTPS": true
-            }
-          },
-          "Web": {
-            "${TS_CERT_DOMAIN}:443": {
-              "Handlers": {
-                "/": {
-                  "Proxy": "http://127.0.0.1:5000"
-                }
-              }
-            }
-          },
-          "AllowFunnel": {
-            "${TS_CERT_DOMAIN}:443": false
-          }
-        }
-      TS_EXTRA_ARGS: --reset
+      TS_USERSPACE: "true"
+      TS_SERVE_CONFIG: /config/serve.json
+    configs:
+      - source: registry_serve
+        target: /config/serve.json
     volumes:
-      - ./tailscale/state:/var/lib/tailscale
-      - /dev/net/tun:/dev/net/tun
-    cap_add:
-      - NET_ADMIN
-      - SYS_MODULE
-    restart: unless-stopped
+      - tailscale-state:/var/lib/tailscale
+    networks:
+      - registry
+    deploy:
+      replicas: 1
+      restart_policy:
+        condition: any
+      placement:
+        constraints:
+          - node.labels.registry == true
 
   registry:
     image: registry:2
-    container_name: registry2
-    network_mode: service:tailscale
-    depends_on:
-      - tailscale
     environment:
-      REGISTRY_STORAGE_FILESYSTEM_ROOTDIRECTORY: /var/lib/registry
       REGISTRY_HTTP_ADDR: 0.0.0.0:5000
-      REGISTRY_HTTP_HEADERS_Access-Control-Allow-Origin: '["*"]'
-      REGISTRY_HTTP_HEADERS_Access-Control-Allow-Methods: "[HEAD,GET,OPTIONS,DELETE]"
-      REGISTRY_HTTP_HEADERS_Access-Control-Allow-Headers: "[Authorization,Accept,Cache-Control]"
-      REGISTRY_HTTP_HEADERS_Access-Control-Expose-Headers: "[Docker-Content-Digest]"
-      REGISTRY_HTTP_HEADERS_Access-Control-Allow-Credentials: "[true]"
+      REGISTRY_STORAGE_DELETE_ENABLED: "true"
     volumes:
       - registry-data:/var/lib/registry
-    restart: unless-stopped
+    networks:
+      - registry
+    deploy:
+      replicas: 1
+      restart_policy:
+        condition: any
+      placement:
+        constraints:
+          - node.labels.registry == true
+
+networks:
+  registry:
+    driver: overlay
 
 volumes:
+  tailscale-state:
   registry-data:
+
+configs:
+  registry_serve:
+    # Bei Änderung an serve.json den Namen erhöhen (…_v2), Swarm-Configs sind unveränderlich.
+    name: registry_serve_v1
+    file: ./tailscale/serve.json
