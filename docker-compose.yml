@@ -2,15 +2,33 @@ services:
   tailscale:
     image: tailscale/tailscale:stable
     hostname: registry2
+    # containerboot liest den Auth Key nur aus der Umgebung, daher aus dem Secret exportieren.
+    # Die Serve-Config wird beim Start erzeugt, damit der Stack ohne Begleitdateien
+    # (z. B. im Portainer-Editor) deploybar ist. ${TS_CERT_DOMAIN} ersetzt containerboot selbst.
+    entrypoint:
+      - /bin/sh
+      - -c
+      - |
+        export TS_AUTHKEY="$$(cat /run/secrets/ts_authkey)"
+        cat > /tmp/serve.json <<'EOF'
+        {
+          "TCP": {"443": {"HTTPS": true}},
+          "Web": {
+            "$${TS_CERT_DOMAIN}:443": {
+              "Handlers": {"/": {"Proxy": "http://registry:5000"}}
+            }
+          },
+          "AllowFunnel": {"$${TS_CERT_DOMAIN}:443": false}
+        }
+        EOF
+        exec /usr/local/bin/containerboot
     environment:
-      TS_AUTHKEY: ${TS_AUTHKEY}
       TS_HOSTNAME: registry2
       TS_STATE_DIR: /var/lib/tailscale
       TS_USERSPACE: "true"
-      TS_SERVE_CONFIG: /config/serve.json
-    configs:
-      - source: registry_serve
-        target: /config/serve.json
+      TS_SERVE_CONFIG: /tmp/serve.json
+    secrets:
+      - ts_authkey
     volumes:
       - tailscale-state:/var/lib/tailscale
     networks:
@@ -48,8 +66,6 @@ volumes:
   tailscale-state:
   registry-data:
 
-configs:
-  registry_serve:
-    # Bei Änderung an serve.json den Namen erhöhen (…_v2), Swarm-Configs sind unveränderlich.
-    name: registry_serve_v1
-    file: ./tailscale/serve.json
+secrets:
+  ts_authkey:
+    external: true
